@@ -4,11 +4,12 @@ import (
 	"context"
 	"errors"
 	"net"
-	"sync"
 	"time"
 
 	"github.com/gobwas/ws"
 	"github.com/gobwas/ws/wsutil"
+
+	"github.com/moeryomenko/synx"
 )
 
 const (
@@ -25,11 +26,11 @@ const (
 // WebSocket respresents autoreconnected websocket connection upon gorilla/websocket.
 type WebSocket struct {
 	url string
-	mu  sync.RWMutex
 
 	conn       net.Conn
 	sendBuffer chan []byte
 	recvBuffer chan []byte
+	spinlock   synx.Spinlock
 	closec     chan error
 
 	cleanupHook   func(context.Context)
@@ -154,7 +155,12 @@ func (wsocket *WebSocket) WriteMessage(ctx context.Context, msg []byte) error {
 
 // NotifyError notifies the connection about error and re-establish the connection.
 func (wsocket *WebSocket) NotifyError(err error) {
-	wsocket.closec <- err
+	wsocket.spinlock.Lock()
+	select {
+	case wsocket.closec <- err:
+	default:
+	}
+	wsocket.spinlock.Unlock()
 }
 
 // Runs periodic reading of messages from the connection.
@@ -175,7 +181,7 @@ func (wsocket *WebSocket) readPump() {
 
 			message, err := wsutil.ReadServerText(wsocket.conn)
 			if err != nil {
-				wsocket.closec <- err
+				wsocket.NotifyError(err)
 				continue
 			}
 
@@ -198,13 +204,13 @@ func (wsocket *WebSocket) writePump() {
 
 			err = wsocket.conn.SetWriteDeadline(time.Now().Add(wsocket.writeTimeout))
 			if err != nil {
-				wsocket.closec <- err
+				wsocket.NotifyError(err)
 				continue
 			}
 
 			err = wsutil.WriteClientText(wsocket.conn, message)
 			if err != nil && !errors.Is(err, net.ErrClosed) {
-				wsocket.closec <- err
+				wsocket.NotifyError(err)
 				continue
 			}
 		case <-wsocket.ctx.Done():
@@ -214,9 +220,9 @@ func (wsocket *WebSocket) writePump() {
 }
 
 func (wsocket *WebSocket) cleanup() {
-	wsocket.mu.Lock()
-	defer wsocket.mu.Unlock()
-	close(wsocket.closec)
+	wsocket.spinlock.Lock()
+	defer wsocket.spinlock.Unlock()
+	wsocket.closec = nil
 	close(wsocket.sendBuffer)
 	close(wsocket.recvBuffer)
 
@@ -251,24 +257,24 @@ func (wsocket *WebSocket) heartbeat() {
 			deadline := time.Now().Add(wsocket.pingPeriod / 2)
 			err = wsocket.conn.SetWriteDeadline(deadline)
 			if err != nil {
-				wsocket.closec <- err
+				wsocket.NotifyError(err)
 				continue
 			}
 
 			err = wsutil.WriteClientMessage(wsocket.conn, ws.OpPing, nil)
 			if err != nil && !errors.Is(err, net.ErrClosed) {
-				wsocket.closec <- err // re-esteblish connection next time.
+				wsocket.NotifyError(err)
 				continue
 			}
 
 			err = wsocket.conn.SetReadDeadline(time.Now().Add(wsocket.pongWait))
 			if err != nil {
-				wsocket.closec <- err
+				wsocket.NotifyError(err)
 				continue
 			}
 			err = wsutil.HandleServerControlMessage(wsocket.conn, wsutil.Message{OpCode: ws.OpPong})
 			if err != nil && !errors.Is(err, net.ErrClosed) {
-				wsocket.closec <- err
+				wsocket.NotifyError(err)
 				continue
 			}
 		case <-wsocket.ctx.Done():
@@ -281,22 +287,18 @@ func (wsocket *WebSocket) heartbeat() {
 // or establish a new connection.
 func (wsocket *WebSocket) establish() error {
 	// in fast path we can just check closec.
-	wsocket.mu.RLock()
+	wsocket.spinlock.Lock()
+	defer wsocket.spinlock.Unlock()
 	if wsocket.conn != nil {
 		select {
 		// If it was closed, open a new one.
 		case <-wsocket.closec:
 			// If it isn't closed, nothing to do.
 		default:
-			wsocket.mu.RUnlock()
 			return nil
 		}
 	}
 
-	// slow path: releae read lock, and acquire write lock and reconnect.
-	wsocket.mu.RUnlock()
-	wsocket.mu.Lock()
-	defer wsocket.mu.Unlock()
 	// Create a new connection.
 	var conn net.Conn
 	err := runWithContext(wsocket.ctx, func() (err error) {
